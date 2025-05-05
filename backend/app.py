@@ -1,88 +1,153 @@
-from flask import Flask, request, jsonify
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-import mysql.connector
-from werkzeug.security import generate_password_hash, check_password_hash
+from auth.routes import auth_bp
+import os
 
 app = Flask(__name__)
-CORS(app)  # This enables CORS for all domains
+CORS(app)
 
-# MySQL database connection
-db = mysql.connector.connect(
-    host="localhost",
-    user="root",  # Replace with your MySQL username
-    password="nandan@2025",  # Replace with your MySQL password
-    database="mediverse_auth"  # Replace with your database name
-)
+# Configuration - for demo purpose using sqlite, replace with PostgreSQL/MySQL as needed
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'hospital.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'your-secret-key'  # Change this to a strong secret in production
 
-# Function to check if the user exists in the database
-def user_exists(user):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s", (user,))
-    return cursor.fetchone()
+db = SQLAlchemy(app)
 
-# Function to create a new user
-def create_user(user, name, email, mobile, password):
-    hashed_password = generate_password_hash(password)
-    cursor = db.cursor()
-    cursor.execute(
-        "INSERT INTO users (username, name, email, mobile, password) VALUES (%s, %s, %s, %s, %s)",
-        (user, name, email, mobile, hashed_password),
-    )
-    db.commit()
+# Import models here to register with SQLAlchemy
+from models.models import User, Appointment, MedicalRecord, Billing, Notification, BedAvailability
 
-# Function to authenticate the user
-def authenticate_user(user, password):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s", (user,))
-    result = cursor.fetchone()
-    if result and check_password_hash(result['password'], password):
-        return result
-    return None
+# Create tables
+with app.app_context():
+    db.create_all()
 
-@app.route('/signup', methods=['POST'])
-def signup():
-    data = request.get_json()
-    user = data.get('user')
-    name = data.get('name')
-    email = data.get('email')
-    mobile = data.get('mobile')
-    password = data.get('password')
+# Register auth blueprint
+app.register_blueprint(auth_bp, url_prefix='/auth')
 
-    # Check if the user already exists
-    if user_exists(user):
-        return jsonify({"message": "User already exists!"}), 400
-
-    # Create a new user
-    create_user(user, name, email, mobile, password)
-    return jsonify({"message": "User created successfully!"}), 201
-
-@app.route('/signin', methods=['POST'])
-def signin():
-    data = request.get_json()
-    user = data.get('user')
-    password = data.get('password')
-
-    # Authenticate the user
-    user_data = authenticate_user(user, password)
-    if not user_data:
-        return jsonify({"message": "Invalid username or password!"}), 401
-
-    # Successful login
-    return jsonify({
-        "message": "Signed in successfully!",
-        "role": user_data['role']  # Assuming you have a 'role' column in your 'users' table
-    }), 200
+# Routes - Dashboard, appointments, records, billing, notifications, bed_status, chatbot
+from flask import request, jsonify
+from auth.utils import token_required, get_jwt_identity
+from sqlalchemy import and_
+from datetime import datetime
 
 @app.route('/dashboard', methods=['GET'])
-def dashboard():
-    role = request.args.get('role')  # Or use authentication headers, etc.
-
-    if role == 'admin':
-        return jsonify({"message": "Welcome, Admin!"}), 200
-    elif role == 'user':
-        return jsonify({"message": "Welcome, User!"}), 200
+@token_required
+def dashboard(current_user):
+    if current_user.role == 'admin':
+        return jsonify({'message': f'Welcome Admin {current_user.full_name}'})
     else:
-        return jsonify({"message": "Unauthorized access!"}), 403
+        return jsonify({'message': f'Welcome Patient {current_user.full_name}'})
 
-if __name__ == "__main__":
+@app.route('/appointments', methods=['GET', 'POST'])
+@token_required
+def appointments(current_user):
+    if request.method == 'GET':
+        if current_user.role == 'admin':
+            # Admin: return all appointments
+            appts = Appointment.query.all()
+        else:
+            # Patient: return only their appointments
+            appts = Appointment.query.filter_by(user_id=current_user.id).all()
+        result = []
+        for a in appts:
+            result.append({
+                'id': a.id,
+                'doctor_name': a.doctor_name,
+                'department': a.department,
+                'scheduled_at': a.scheduled_at.isoformat() if a.scheduled_at else None,
+                'status': a.status
+            })
+        return jsonify(result)
+    elif request.method == 'POST':
+        if current_user.role != 'patient':
+            return jsonify({'error': 'Only patients can book appointments'}), 403
+        data = request.json
+        doctor_name = data.get('doctor_name')
+        department = data.get('department')
+        scheduled_at_str = data.get('scheduled_at')
+        try:
+            scheduled_at = datetime.fromisoformat(scheduled_at_str)
+        except Exception:
+            return jsonify({'error': 'Invalid date format'}), 400
+        new_appt = Appointment(user_id=current_user.id, doctor_name=doctor_name,
+                               department=department, scheduled_at=scheduled_at)
+        db.session.add(new_appt)
+        db.session.commit()
+        return jsonify({'message': 'Appointment booked', 'appointment_id': new_appt.id}), 201
+
+@app.route('/records', methods=['GET'])
+@token_required
+def records(current_user):
+    if current_user.role == 'admin':
+        records = MedicalRecord.query.all()
+    else:
+        records = MedicalRecord.query.filter_by(user_id=current_user.id).all()
+    result = []
+    for r in records:
+        result.append({
+            'id': r.id,
+            'diagnosis': r.diagnosis,
+            'prescriptions': r.prescriptions,
+            'lab_results': r.lab_results,
+            'created_at': r.created_at.isoformat()
+        })
+    return jsonify(result)
+
+@app.route('/billing', methods=['GET'])
+@token_required
+def billing(current_user):
+    if current_user.role == 'admin':
+        bills = Billing.query.all()
+    else:
+        bills = Billing.query.filter_by(user_id=current_user.id).all()
+    result = []
+    for b in bills:
+        result.append({
+            'id': b.id,
+            'appointment_id': b.appointment_id,
+            'amount': float(b.amount),
+            'discount_applied': b.discount_applied,
+            'insurance_scheme': b.insurance_scheme,
+            'qr_code_url': b.qr_code_url,
+            'paid': b.paid
+        })
+    return jsonify(result)
+
+@app.route('/notifications', methods=['GET'])
+@token_required
+def notifications(current_user):
+    notes = Notification.query.filter_by(user_id=current_user.id).order_by(Notification.sent_at.desc()).all()
+    result = []
+    for n in notes:
+        result.append({
+            'message': n.message,
+            'sent_at': n.sent_at.isoformat()
+        })
+    return jsonify(result)
+
+@app.route('/bed-status', methods=['GET'])
+@token_required
+def bed_status(current_user):
+    beds = BedAvailability.query.all()
+    result = []
+    for b in beds:
+        result.append({
+            'ward_name': b.ward_name,
+            'total_beds': b.total_beds,
+            'occupied_beds': b.occupied_beds,
+            'last_updated': b.last_updated.isoformat()
+        })
+    return jsonify(result)
+
+@app.route('/chatbot', methods=['POST'])
+@token_required
+def chatbot(current_user):
+    # For demo, returns simple echo message - replace with actual chatbot logic
+    data = request.json
+    question = data.get('question', '')
+    response = f"You asked: {question}. For assistance, contact your hospital."
+    return jsonify({'answer': response})
+
+if __name__ == '__main__':
     app.run(debug=True)
